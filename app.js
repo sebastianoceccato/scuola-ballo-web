@@ -67,7 +67,7 @@ const ICON = {
 };
 
 /* ========================= Database (IndexedDB) ========================= */
-const STORES = ['students', 'locations', 'courses', 'enrollments', 'lessons', 'attendance', 'payments', 'certificates', 'settings'];
+const STORES = ['students', 'locations', 'courses', 'enrollments', 'lessons', 'attendance', 'payments', 'certificates', 'settings', 'aliases'];
 const KEY = {
   students: (o) => o.id,
   locations: (o) => o.id,
@@ -78,6 +78,7 @@ const KEY = {
   payments: (o) => o.studentId + '|' + o.y + '|' + o.m, // un pagamento per allievo e mese
   certificates: (o) => o.studentId,
   settings: (o) => o.k,
+  aliases: (o) => o.kind + '|' + o.from, // collegamenti tra codici di altri telefoni e schede di questo
 };
 const S = {};
 STORES.forEach((s) => (S[s] = new Map()));
@@ -85,7 +86,7 @@ let db = null;
 
 function openDB() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open('scuola-ballo', 1);
+    const r = indexedDB.open('scuola-ballo', 2);
     r.onupgradeneeded = () => {
       const d = r.result;
       STORES.forEach((s) => { if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: '_k' }); });
@@ -110,12 +111,28 @@ function write(store, fn) {
     toast('Errore di salvataggio: ' + e.message);
   }
 }
-function put(store, obj) {
+/** Salva un record. Ogni modifica porta data e ora (updatedAt): serve per unire i dati tra telefoni. */
+function put(store, obj, keepTime = false) {
   const o = { ...obj };
+  if (!keepTime || !o.updatedAt) o.updatedAt = Date.now();
   o._k = KEY[store](o);
   S[store].set(o._k, o);
   write(store, (os) => os.put(o));
   return o;
+}
+/** Salva molti record in un'unica transazione (unione dati). */
+function putMany(ops) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction([...new Set(ops.map((o) => o[0]))], 'readwrite');
+    ops.forEach(([store, rec]) => {
+      const o = { ...rec };
+      o._k = KEY[store](o);
+      S[store].set(o._k, o);
+      tx.objectStore(store).put(o);
+    });
+    tx.oncomplete = res;
+    tx.onerror = () => rej(tx.error);
+  });
 }
 
 /* ========================= Regole di dominio ========================= */
@@ -189,7 +206,7 @@ function openLesson(cid, date) {
 const attOf = (lid, sid) => S.attendance.get(lid + '|' + sid)?.status ?? null;
 function lessonRows(lesson) {
   const ids = new Set(studentsOfCourse(lesson.courseId).filter((s) => s.status !== 'ARCHIVIATO').map((s) => s.id));
-  all('attendance').forEach((a) => { if (a.lessonId === lesson.id) ids.add(a.studentId); });
+  all('attendance').forEach((a) => { if (a.lessonId === lesson.id && a.status) ids.add(a.studentId); });
   return [...ids].map((id) => S.students.get(id)).filter(Boolean).sort(byName);
 }
 function lessonCounts(lesson) {
@@ -200,7 +217,7 @@ function lessonCounts(lesson) {
   };
 }
 function studentHistory(sid) {
-  return all('attendance').filter((a) => a.studentId === sid).map((a) => {
+  return all('attendance').filter((a) => a.studentId === sid && a.status).map((a) => {
     const l = S.lessons.get(a.lessonId);
     const c = l && S.courses.get(l.courseId);
     return l && c ? { status: a.status, date: l.date, cancelled: l.cancelled, course: c.name, loc: locName(c.locationId) } : null;
@@ -227,6 +244,227 @@ function paymentRows(ym, locId, courseId) {
     if (locId && !inLocation(s.id, locId)) return false;
     return true;
   }).sort(byName);
+}
+
+/* ========================= Controllo doppioni ========================= */
+/** Testo confrontabile: senza accenti, minuscolo, spazi singoli. */
+const normTxt = (s) => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+/** Telefono confrontabile: solo cifre, senza prefisso internazionale italiano. */
+function normPhone(p) {
+  let d = (p || '').replace(/\D/g, '');
+  if (d.startsWith('0039')) d = d.slice(4);
+  else if (d.startsWith('39') && d.length >= 11) d = d.slice(2);
+  return d;
+}
+const sameName = (a, b) => normTxt(a.firstName) === normTxt(b.firstName) && normTxt(a.lastName) === normTxt(b.lastName);
+const samePhone = (a, b) => { const x = normPhone(a.phone), y = normPhone(b.phone); return !!x && x === y; };
+/** exact = stesso nome, cognome e telefono (sicuramente la stessa persona); partial = solo nome o solo telefono. */
+function findDuplicates(cand, excludeId) {
+  const exact = [], partial = [];
+  all('students').forEach((s) => {
+    if (s.id === excludeId) return;
+    const n = sameName(s, cand), p = samePhone(s, cand);
+    if (n && p) exact.push(s); else if (n || p) partial.push(s);
+  });
+  return { exact, partial };
+}
+
+/* ========================= Formato file comune (Android e iPhone) ========================= */
+/*
+ * Formato 2, identico nelle due app:
+ * { app: "scuola-ballo", format: 2, source, exportedAt, data: { locations, courses, students, enrollments,
+ *   lessons, attendance, payments, certificates, settings? } }
+ * Ogni record ha updatedAt (millisecondi): in caso di conflitto vince la modifica più recente.
+ * Presenza tolta = status null (si propaga agli altri telefoni).
+ */
+const SYNC_STORES = ['locations', 'courses', 'students', 'enrollments', 'lessons', 'attendance', 'payments', 'certificates'];
+const STORE_LABEL = {
+  locations: 'Sedi', courses: 'Corsi', students: 'Allievi', enrollments: 'Iscrizioni',
+  lessons: 'Lezioni', attendance: 'Presenze', payments: 'Pagamenti', certificates: 'Certificati',
+};
+const str = (v) => (v === undefined || v === null || v === '' ? null : String(v));
+const FILE = {
+  locations: {
+    to: (o) => ({ id: o.id, name: o.name, address: str(o.address), notes: str(o.notes), archived: !!o.archived, updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ id: str(o.id), name: str(o.name), address: str(o.address), notes: str(o.notes), archived: !!o.archived, updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.id && o.name,
+  },
+  courses: {
+    to: (o) => ({ id: o.id, locationId: o.locationId, name: o.name, discipline: o.discipline, teacher: str(o.teacher), dayOfWeek: o.dayOfWeek,
+      start: o.start, end: o.end, level: o.level, customLevel: str(o.customLevel), notes: str(o.notes), archived: !!o.archived, updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ id: str(o.id), locationId: str(o.locationId), name: str(o.name), discipline: str(o.discipline) || '', teacher: str(o.teacher),
+      dayOfWeek: +o.dayOfWeek || 1, start: str(o.start) || '20:00', end: str(o.end) || '21:00', level: LEVELS[o.level] ? o.level : 'PRINCIPIANTI',
+      customLevel: str(o.customLevel), notes: str(o.notes), archived: !!o.archived, updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.id && o.locationId && o.name,
+  },
+  students: {
+    to: (o) => ({ id: o.id, firstName: o.firstName, lastName: o.lastName, phone: o.phone, email: str(o.email), birthDate: str(o.birthDate),
+      enrollmentDate: o.enrollmentDate, status: o.status, notes: str(o.notes), createdAt: o.createdAt || 0, updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ id: str(o.id), firstName: str(o.firstName), lastName: str(o.lastName), phone: str(o.phone) || '', email: str(o.email),
+      birthDate: str(o.birthDate), enrollmentDate: str(o.enrollmentDate) || todayISO(), status: ST[o.status] ? o.status : 'ATTIVO',
+      notes: str(o.notes), createdAt: +o.createdAt || 0, updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.id && o.firstName && o.lastName,
+  },
+  enrollments: {
+    to: (o) => ({ studentId: o.studentId, courseId: o.courseId, enrolledOn: str(o.enrolledOn), active: !!o.active, removedOn: str(o.removedOn), updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ studentId: str(o.studentId), courseId: str(o.courseId), enrolledOn: str(o.enrolledOn) || todayISO(), active: !!o.active, removedOn: str(o.removedOn), updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.studentId && o.courseId,
+  },
+  lessons: {
+    to: (o) => ({ id: o.id, courseId: o.courseId, date: o.date, cancelled: !!o.cancelled, notes: str(o.notes), updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ id: str(o.id), courseId: str(o.courseId), date: str(o.date), cancelled: !!o.cancelled, notes: str(o.notes), updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.id && o.courseId && /^\d{4}-\d{2}-\d{2}$/.test(o.date || ''),
+  },
+  attendance: {
+    to: (o) => ({ lessonId: o.lessonId, studentId: o.studentId, status: o.status || null, updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ lessonId: str(o.lessonId), studentId: str(o.studentId), status: ATT[o.status] ? o.status : null, updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.lessonId && o.studentId,
+  },
+  payments: {
+    to: (o) => ({ studentId: o.studentId, year: o.y, month: o.m, paid: !!o.paid, updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ studentId: str(o.studentId), y: +(o.year ?? o.y), m: +(o.month ?? o.m), paid: !!o.paid, updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.studentId && o.y > 2000 && o.m >= 1 && o.m <= 12,
+  },
+  certificates: {
+    to: (o) => ({ studentId: o.studentId, delivered: !!o.delivered, deliveryDate: str(o.deliveryDate), expiryDate: str(o.expiry), notes: str(o.notes), updatedAt: o.updatedAt || 0 }),
+    from: (o) => ({ studentId: str(o.studentId), delivered: !!o.delivered, deliveryDate: str(o.deliveryDate), expiry: str(o.expiryDate ?? o.expiry), notes: str(o.notes), updatedAt: +o.updatedAt || 0 }),
+    ok: (o) => o.studentId,
+  },
+};
+
+function buildExport() {
+  const data = {};
+  SYNC_STORES.forEach((s) => (data[s] = all(s).map(FILE[s].to)));
+  data.settings = all('settings').filter((o) => o.k !== 'lastBackup').map((o) => ({ k: o.k, v: o.v }));
+  return { app: 'scuola-ballo', format: 2, source: 'web', exportedAt: new Date().toISOString(), data };
+}
+
+/** Legge un file esportato (formato 2, o il vecchio backup web) e lo porta al formato interno. */
+function parseExport(p) {
+  if (!p || p.app !== 'scuola-ballo' || !p.data) throw new Error('Questo file non è un backup di Scuola di Ballo');
+  const out = { exportedAt: p.exportedAt || null, source: p.source || 'web' };
+  SYNC_STORES.forEach((s) => {
+    const rows = Array.isArray(p.data[s]) ? p.data[s] : [];
+    out[s] = rows.map((o) => {
+      if (!p.format || p.format < 2) { // vecchio backup web: già nel formato interno
+        if (s === 'payments' || s === 'certificates') return FILE[s].from({ ...o, year: o.y, month: o.m, expiryDate: o.expiry });
+      }
+      return FILE[s].from(o);
+    }).filter(FILE[s].ok);
+  });
+  out.settings = (Array.isArray(p.data.settings) ? p.data.settings : []).filter((o) => o && o.k);
+  return out;
+}
+
+/**
+ * Piano di unione: aggiunge le novità e aggiorna i record se la versione ricevuta è più recente.
+ * Non cancella mai nulla.
+ * Record con lo stesso codice: vince la modifica più recente.
+ * Record creati separatamente su telefoni diversi ma riconosciuti come la stessa cosa vengono solo
+ * COLLEGATI (la scheda di questo telefono resta com'è) e il collegamento viene ricordato:
+ * - sede con lo stesso nome; corso con stessa sede, nome, giorno e ora;
+ * - allievo con stesso nome, cognome e telefono (automatico);
+ * - allievo con solo nome uguale o solo telefono uguale: decide l'utente (decisions[idRicevuto] = idLocale);
+ * - lezione dello stesso corso nella stessa data (qui l'annullamento più recente vale).
+ */
+function planMerge(inc, decisions = {}) {
+  const ops = [];
+  const sum = { nuovi: {}, aggiornati: {} };
+  const count = (k, s) => { sum[k][s] = (sum[k][s] || 0) + 1; };
+  const newer = (r, local) => (r.updatedAt || 0) > (local.updatedAt || 0);
+  const upsert = (store, rec, local) => {
+    if (!local) { ops.push([store, rec]); count('nuovi', store); } else if (newer(rec, local)) { ops.push([store, rec]); count('aggiornati', store); }
+  };
+  const locs = all('locations'), courses = all('courses'), studs = all('students'), lessons = all('lessons');
+  const has = (arr, id) => arr.some((x) => x.id === id);
+  const maps = { location: {}, course: {}, student: {}, lesson: {} };
+  const candidates = [];
+  /** Collegamento già noto (da un'unione precedente) verso un record di questo telefono. */
+  const alias = (kind, id, arr) => { const a = S.aliases.get(kind + '|' + id); return a && has(arr, a.to) ? a.to : null; };
+  const link = (kind, from, to) => {
+    maps[kind][from] = to;
+    if (!S.aliases.has(kind + '|' + from)) { ops.push(['aliases', { kind, from, to }]); if (kind === 'student') sum.collegati = (sum.collegati || 0) + 1; }
+  };
+
+  inc.locations.forEach((l) => {
+    const local = S.locations.get(l.id);
+    if (local) { maps.location[l.id] = l.id; upsert('locations', l, local); return; }
+    const m = alias('location', l.id, locs) || locs.find((x) => normTxt(x.name) === normTxt(l.name))?.id;
+    if (m) { link('location', l.id, m); return; }
+    maps.location[l.id] = l.id; locs.push(l); upsert('locations', l, null);
+  });
+
+  inc.courses.forEach((c) => {
+    const r = { ...c, locationId: maps.location[c.locationId] || c.locationId };
+    if (!has(locs, r.locationId)) return;
+    const local = S.courses.get(c.id);
+    if (local) { maps.course[c.id] = c.id; upsert('courses', r, local); return; }
+    const m = alias('course', c.id, courses) || courses.find((x) => x.locationId === r.locationId && normTxt(x.name) === normTxt(r.name)
+      && x.dayOfWeek === r.dayOfWeek && x.start === r.start)?.id;
+    if (m) { link('course', c.id, m); return; }
+    maps.course[c.id] = c.id; courses.push(r); upsert('courses', r, null);
+  });
+
+  inc.students.forEach((s) => {
+    const local = S.students.get(s.id);
+    if (local) { maps.student[s.id] = s.id; upsert('students', s, local); return; }
+    const known = alias('student', s.id, studs) || studs.find((x) => sameName(x, s) && samePhone(x, s))?.id;
+    if (known) { link('student', s.id, known); return; }
+    const partial = studs.filter((x) => sameName(x, s) || samePhone(x, s));
+    if (partial.length) {
+      candidates.push({ inc: s, matches: partial });
+      const target = decisions[s.id] && studs.find((x) => x.id === decisions[s.id]);
+      if (target) { link('student', s.id, target.id); return; }
+    }
+    maps.student[s.id] = s.id; studs.push(s); upsert('students', s, null);
+  });
+
+  const mS = (id) => maps.student[id] || id, mC = (id) => maps.course[id] || id;
+  inc.enrollments.forEach((e) => {
+    const r = { ...e, studentId: mS(e.studentId), courseId: mC(e.courseId) };
+    if (!has(studs, r.studentId) || !has(courses, r.courseId)) return;
+    upsert('enrollments', r, S.enrollments.get(r.studentId + '|' + r.courseId));
+  });
+
+  inc.lessons.forEach((l) => {
+    const r = { ...l, courseId: mC(l.courseId) };
+    if (!has(courses, r.courseId)) return;
+    let local = S.lessons.get(l.id);
+    if (!local) {
+      const m = lessons.find((x) => x.id === alias('lesson', l.id, lessons)) || lessons.find((x) => x.courseId === r.courseId && x.date === r.date);
+      if (m) { link('lesson', l.id, m.id); upsert('lessons', { ...m, cancelled: r.cancelled, notes: r.notes, updatedAt: r.updatedAt }, m); return; }
+      maps.lesson[l.id] = l.id; lessons.push(r); upsert('lessons', r, null); return;
+    }
+    if (local.date !== r.date && lessons.some((x) => x.id !== l.id && x.courseId === r.courseId && x.date === r.date)) r.date = local.date;
+    maps.lesson[l.id] = l.id; upsert('lessons', r, local);
+  });
+
+  inc.attendance.forEach((a) => {
+    const r = { ...a, lessonId: maps.lesson[a.lessonId] || a.lessonId, studentId: mS(a.studentId) };
+    if (!has(lessons, r.lessonId) || !has(studs, r.studentId)) return;
+    upsert('attendance', r, S.attendance.get(r.lessonId + '|' + r.studentId));
+  });
+  inc.payments.forEach((p) => {
+    const r = { ...p, studentId: mS(p.studentId) };
+    if (!has(studs, r.studentId)) return;
+    upsert('payments', r, S.payments.get(`${r.studentId}|${r.y}|${r.m}`));
+  });
+  inc.certificates.forEach((c) => {
+    const r = { ...c, studentId: mS(c.studentId) };
+    if (!has(studs, r.studentId)) return;
+    upsert('certificates', r, S.certificates.get(r.studentId));
+  });
+  return { ops, sum, candidates };
+}
+
+function summaryHtml(sum) {
+  const lines = SYNC_STORES.map((s) => {
+    const n = sum.nuovi[s] || 0, a = sum.aggiornati[s] || 0;
+    if (!n && !a) return '';
+    return `<div class="info"><b>${STORE_LABEL[s]}</b><span>${[n ? `${n} nuovi` : '', a ? `${a} aggiornati` : ''].filter(Boolean).join(', ')}</span></div>`;
+  }).join('');
+  const linked = sum.collegati ? `<div class="info"><b>Riconosciuti</b><span>${sum.collegati} allievi già presenti (collegati alla scheda esistente)</span></div>` : '';
+  return lines || linked ? lines + linked : '<p>Nessuna novità: i dati di questo telefono sono già allineati con il file.</p>';
 }
 
 /* ========================= Interfaccia: infrastruttura ========================= */
@@ -829,14 +1067,18 @@ SCREENS.settings = () => {
         <button class="btn" data-act="saveWarnings">Salva</button>
       </div>
       <div class="card">
-        <div class="card-h"><h2>Backup dei dati</h2></div>
-        <div class="muted small">I dati sono salvati solo su questo telefono. Fai un backup ogni tanto e conservalo in un posto sicuro (ad esempio "File" o il tuo cloud): contiene dati personali degli allievi.</div>
-        <div class="grid2" style="margin-top:12px">
-          <button class="btn tonal" data-act="exportBackup">Crea backup</button>
-          <button class="btn outline" data-act="importBackup">Ripristina</button>
-        </div>
+        <div class="card-h"><h2>Condivisione tra maestri e backup</h2></div>
+        <div class="muted small">Il file esportato funziona sia con l'app Android sia con quella per iPhone.</div>
+        <button class="btn block" style="margin-top:12px" data-act="exportBackup">Esporta dati</button>
+        <div class="muted small" style="margin:4px 4px 12px">Crea un file con tutti i dati di questo telefono: mandalo agli altri maestri o conservalo come backup.</div>
+        <button class="btn tonal block" data-act="mergeImport">Unisci dati ricevuti</button>
+        <div class="muted small" style="margin:4px 4px 12px">Aggiunge i dati dei file ricevuti da altri maestri. Non cancella nulla; se lo stesso dato è stato modificato su due telefoni vale la modifica più recente.</div>
+        <button class="btn outline block" data-act="importBackup">Ripristina da backup</button>
+        <div class="muted small" style="margin:4px 4px 0">Sostituisce tutti i dati di questo telefono con quelli del file (es. telefono nuovo).</div>
         <input type="file" id="importFile" accept="application/json,.json" style="display:none">
-        <div class="muted small" style="margin-top:8px">Ultimo backup: ${getSetting('lastBackup', null) ? fmtDate(getSetting('lastBackup')) : 'mai'}</div>
+        <input type="file" id="mergeFile" accept="application/json,.json" multiple style="display:none">
+        <div class="muted small" style="margin-top:12px">Ultima esportazione: ${getSetting('lastBackup', null) ? fmtDate(getSetting('lastBackup')) : 'mai'}</div>
+        <div class="err">I file contengono dati personali degli allievi: inviali solo ai maestri e cancellali dalle chat dopo averli importati.</div>
       </div>
       <div class="card">
         <div class="card-h"><h2>Installazione</h2></div>
@@ -853,7 +1095,7 @@ SCREENS.settings = () => {
         • Gli allievi archiviati non vengono cancellati: lo storico resta consultabile.</div>
         <div class="err" style="margin-top:8px">Importante: se elimini l'app dalla Home o cancelli i dati del browser per questo sito, i dati vengono persi. Usa il backup.</div>
       </div>
-      <div class="card"><div class="info"><b>Applicazione</b><span>Scuola di Ballo · web app</span></div><div class="info"><b>Versione</b><span>1.0.0</span></div></div>`,
+      <div class="card"><div class="info"><b>Applicazione</b><span>Scuola di Ballo · web app</span></div><div class="info"><b>Versione</b><span>1.1.0</span></div></div>`,
     after: async () => {
       const el = $('#persistInfo');
       if (el && navigator.storage && navigator.storage.persisted) {
@@ -909,15 +1151,19 @@ A.saveStudent = (d) => {
     toast(isNew ? 'Allievo creato' : 'Modifiche salvate');
     if (isNew) location.replace('#/student/' + s.id); else back();
   };
-  const norm = (p) => p.replace(/[^\d+]/g, '');
-  const changed = !orig || orig.firstName.toLowerCase() !== v.firstName.toLowerCase() || orig.lastName.toLowerCase() !== v.lastName.toLowerCase() || norm(orig.phone) !== norm(v.phone);
-  const dups = changed ? all('students').filter((s) => s.id !== orig?.id &&
-    ((s.firstName.trim().toLowerCase() === v.firstName.toLowerCase() && s.lastName.trim().toLowerCase() === v.lastName.toLowerCase()) || norm(s.phone) === norm(v.phone))) : [];
-  if (dups.length) {
-    modal('Possibile duplicato', `<p>Esistono già allievi con lo stesso nome o lo stesso telefono:</p>
-      <ul>${dups.slice(0, 5).map((s) => `<li>${esc(fullName(s))} · ${esc(s.phone)} (${ST[s.status][0]})</li>`).join('')}</ul>
-      <p class="muted small">Se è la stessa persona, aprila dall'elenco e iscrivila agli altri corsi invece di creare una nuova scheda.</p>`,
-    [{ label: 'Rivedi', fn: closeModal }, { label: 'Salva comunque', cls: '', fn: () => { closeModal(); doSave(); } }]);
+  const changed = !orig || !sameName(orig, v) || !samePhone(orig, v);
+  const dups = changed ? findDuplicates(v, orig?.id) : { exact: [], partial: [] };
+  if (dups.exact.length) {
+    // Stesso nome, cognome e telefono: è sicuramente la stessa persona, non si crea un doppione.
+    const ex = dups.exact[0];
+    modal('Allievo già presente', `<p>Esiste già <b>${esc(fullName(ex))}</b> con lo stesso telefono (${esc(ex.phone)}), stato: ${ST[ex.status][0].toLowerCase()}.</p>
+      <p class="muted small">Non è possibile creare due schede identiche. Apri la scheda esistente: da lì puoi iscriverlo ad altri corsi${ex.status !== 'ATTIVO' ? ' o riattivarlo' : ''}.</p>`,
+    [{ label: 'Annulla', fn: closeModal }, { label: 'Apri scheda esistente', cls: '', fn: () => { closeModal(); delete UI.forms[key]; location.replace('#/student/' + ex.id); } }]);
+  } else if (dups.partial.length) {
+    modal('Possibile doppione', `<p>Esistono già allievi con lo stesso nome o lo stesso telefono:</p>
+      <ul>${dups.partial.slice(0, 5).map((s) => `<li>${esc(fullName(s))} · ${esc(s.phone)} (${ST[s.status][0]})</li>`).join('')}</ul>
+      <p class="muted small">Se è la stessa persona, aprila dall'elenco e iscrivila agli altri corsi invece di creare una nuova scheda. Se sono persone diverse (es. omonimi, o familiari con lo stesso telefono) puoi salvare.</p>`,
+    [{ label: 'Rivedi', fn: closeModal }, { label: 'Sono persone diverse, salva', cls: '', fn: () => { closeModal(); doSave(); } }]);
   } else doSave();
 };
 
@@ -1056,8 +1302,9 @@ A.openSelectedLesson = () => { if (UI.att.course && UI.att.date) openLesson(UI.a
 A.att = (d) => {
   const k = d.lid + '|' + d.sid;
   const cur = S.attendance.get(k)?.status;
-  if (cur === d.v) { S.attendance.delete(k); write('attendance', (os) => os.delete(k)); } // secondo tocco: annulla
-  else put('attendance', { lessonId: d.lid, studentId: d.sid, status: d.v, updatedAt: Date.now() });
+  // Secondo tocco sullo stesso stato: la presenza viene tolta. Si salva come "tolta" (status null)
+  // e non si cancella, così la correzione arriva anche agli altri telefoni quando si uniscono i dati.
+  put('attendance', { lessonId: d.lid, studentId: d.sid, status: cur === d.v ? null : d.v });
   render();
 };
 A.markAllPresent = (d) => {
@@ -1106,46 +1353,103 @@ A.saveWarnings = () => {
 };
 
 A.exportBackup = async () => {
-  const data = {};
-  STORES.forEach((s) => (data[s] = all(s).map(({ _k, ...rest }) => rest)));
-  const json = JSON.stringify({ app: 'scuola-ballo', version: 1, exportedAt: new Date().toISOString(), data }, null, 1);
-  const name = `scuola-ballo-backup-${todayISO()}.json`;
+  const json = JSON.stringify(buildExport());
+  const d = new Date();
+  const name = `scuola-ballo-${todayISO()}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
   const file = new File([json], name, { type: 'application/json' });
   setSetting('lastBackup', todayISO());
   try {
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      await navigator.share({ files: [file], title: 'Backup Scuola di Ballo' });
-      toast('Backup creato'); render(); return;
+      await navigator.share({ files: [file], title: 'Dati Scuola di Ballo' });
+      toast('Dati esportati'); render(); return;
     }
   } catch (e) { if (e.name === 'AbortError') return; }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(file); a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-  toast('Backup scaricato: ' + name); render();
+  toast('File salvato: ' + name); render();
 };
+
+async function readExportFile(f) {
+  let raw;
+  try { raw = JSON.parse(await f.text()); } catch { throw new Error(`"${f.name}" non è un file valido`); }
+  return parseExport(raw);
+}
+
+/** Ripristino completo: sostituisce tutti i dati del telefono con quelli del file. */
 A.importBackup = () => {
   const input = $('#importFile');
   input.value = '';
   input.onchange = async () => {
     const f = input.files[0];
     if (!f) return;
-    let parsed;
-    try { parsed = JSON.parse(await f.text()); } catch { toast('File non valido'); return; }
-    if (!parsed || parsed.app !== 'scuola-ballo' || !parsed.data) { toast('Questo file non è un backup di Scuola di Ballo'); return; }
-    const n = (parsed.data.students || []).length;
-    confirmBox('Ripristinare il backup?', `Il backup del ${fmtDate((parsed.exportedAt || '').slice(0, 10))} contiene ${n} allievi. Tutti i dati attuali su questo telefono verranno SOSTITUITI.`, 'Ripristina', async () => {
+    let inc;
+    try { inc = await readExportFile(f); } catch (e) { toast(e.message); return; }
+    confirmBox('Ripristinare il backup?', `Il file del ${fmtDate((inc.exportedAt || '').slice(0, 10))} contiene ${inc.students.length} allievi. Tutti i dati attuali su questo telefono verranno SOSTITUITI.`, 'Ripristina', async () => {
       await new Promise((res, rej) => {
         const tx = db.transaction(STORES, 'readwrite');
         STORES.forEach((s) => {
           const os = tx.objectStore(s);
           os.clear();
-          (parsed.data[s] || []).forEach((o) => { const r = { ...o }; r._k = KEY[s](r); os.put(r); });
+          const rows = (s === 'settings' ? inc.settings : inc[s]) || [];
+          rows.forEach((o) => { const r = { ...o }; r._k = KEY[s](r); os.put(r); });
         });
         tx.oncomplete = res; tx.onerror = () => rej(tx.error);
       }).then(async () => { await loadAll(); toast('Backup ripristinato'); go('#/home'); })
         .catch((e) => toast('Ripristino non riuscito: ' + (e && e.message)));
     });
+  };
+  input.click();
+};
+
+/** Unione: aggiunge i dati ricevuti da altri maestri (uno o più file), senza cancellare nulla. */
+A.mergeImport = () => {
+  const input = $('#mergeFile');
+  input.value = '';
+  input.onchange = async () => {
+    const files = [...input.files];
+    const queue = [];
+    for (const f of files) {
+      try { queue.push({ name: f.name, inc: await readExportFile(f) }); } catch (e) { toast(e.message); }
+    }
+    let merged = 0;
+    const next = () => {
+      const item = queue.shift();
+      if (!item) { if (merged) { toast('Dati uniti'); render(); } return; }
+      const plan = planMerge(item.inc);
+      const pos = files.length > 1 ? ` (${files.length - queue.length}/${files.length})` : '';
+      const dupHtml = plan.candidates.length ? `
+        <div class="sec-title"><span>Possibili doppioni (${plan.candidates.length})</span></div>
+        <div class="muted small">Questi allievi del file hanno lo stesso nome <i>oppure</i> lo stesso telefono di un allievo già presente. Indica se sono la stessa persona.</div>
+        ${plan.candidates.map((c) => `<div class="card" style="margin:8px 0;padding:12px">
+          <div><b>${esc(fullName(c.inc))}</b> · ${esc(c.inc.phone)}</div>
+          <select class="in" style="margin-top:8px" data-dup="${esc(c.inc.id)}">
+            ${opt('', 'Persona diversa: aggiungi come nuovo allievo', '')}
+            ${c.matches.map((m) => opt(m.id, `Stessa persona di: ${fullName(m)} · ${m.phone}`, '')).join('')}
+          </select></div>`).join('')}` : '';
+      modal('Unisci dati' + pos, `
+        <div class="muted small">File: ${esc(item.name)}${item.inc.exportedAt ? ' · esportato il ' + fmtDate(item.inc.exportedAt.slice(0, 10)) : ''}</div>
+        <div style="margin:8px 0" id="mergeSum">${summaryHtml(plan.sum)}</div>${dupHtml}
+        <div class="muted small" style="margin-top:8px">Gli allievi con stesso nome, cognome e telefono vengono riconosciuti automaticamente come la stessa persona.</div>`,
+      [{ label: 'Annulla', fn: () => { closeModal(); next(); } }, {
+        label: 'Unisci', cls: '', fn: async () => {
+          const decisions = {};
+          document.querySelectorAll('#modal [data-dup]').forEach((s) => { if (s.value) decisions[s.dataset.dup] = s.value; });
+          const final = planMerge(item.inc, decisions);
+          closeModal();
+          try { if (final.ops.length) await putMany(final.ops); merged++; } catch (e) { toast('Unione non riuscita: ' + (e && e.message)); }
+          next();
+        },
+      }]);
+      // Il riepilogo si aggiorna quando si sceglie "stessa persona"
+      document.querySelectorAll('#modal [data-dup]').forEach((sel) => sel.addEventListener('change', () => {
+        const dec = {};
+        document.querySelectorAll('#modal [data-dup]').forEach((x) => { if (x.value) dec[x.dataset.dup] = x.value; });
+        $('#mergeSum').innerHTML = summaryHtml(planMerge(item.inc, dec).sum);
+      }));
+    };
+    next();
   };
   input.click();
 };
